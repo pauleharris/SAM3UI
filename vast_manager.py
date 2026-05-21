@@ -72,6 +72,22 @@ _STATUS_TO_STATE: dict[str, str] = {
 STATES = ("cold", "standby", "starting", "ready", "stopping", "unknown", "error")
 
 
+def _get_status(inst: dict) -> str:
+    """
+    Extract the current status string from a VAST instance dict.
+
+    The VAST REST API uses 'actual_status' / 'cur_state'; older SDK versions
+    exposed it as 'status'.  Try all three and return lowercase or "".
+    """
+    raw = (
+        inst.get("actual_status") or
+        inst.get("cur_state") or
+        inst.get("status") or
+        ""
+    )
+    return raw.lower().strip()
+
+
 class VastManager:
     """
     Manages a single labeled VAST.AI instance through its lifecycle.
@@ -154,7 +170,7 @@ class VastManager:
         if inst is None:
             return "cold", None
 
-        vast_status = (inst.get("status") or "").lower().strip()
+        vast_status = _get_status(inst)
         mapped = _STATUS_TO_STATE.get(vast_status)
 
         if mapped is None:
@@ -242,7 +258,7 @@ class VastManager:
                 for inst in all_insts:
                     iid    = inst.get("id", "?")
                     lbl    = inst.get("label") or "(no label)"
-                    status = inst.get("status", "?")
+                    status = _get_status(inst) or "?"
                     gpu    = inst.get("gpu_name", "?")
                     cost   = f"${inst.get('dph_total', 0):.3f}/hr"
                     marker = "  ◄ OUR INSTANCE" if lbl == INSTANCE_LABEL else ""
@@ -261,7 +277,7 @@ class VastManager:
         # ── Our instance detail ───────────────────────────────────────────
         lines.append("│")
         if our_inst:
-            vast_status = (our_inst.get("status") or "").lower().strip()
+            vast_status = _get_status(our_inst)
             mapped      = _STATUS_TO_STATE.get(vast_status, "unknown")
             url         = self.get_gradio_url(our_inst)
 
@@ -276,7 +292,7 @@ class VastManager:
                 logical   = mapped.upper()
 
             lines.append(f"│  Our instance #{our_inst.get('id')}:")
-            lines.append(f"│    VAST status   : {our_inst.get('status', '?')!r}")
+            lines.append(f"│    VAST status   : {vast_status!r}")
             lines.append(f"│    Logical state : {logical}")
             lines.append(f"│    GPU           : {our_inst.get('num_gpus', 1)}× {our_inst.get('gpu_name', '?')}")
             lines.append(f"│    Cost          : ${our_inst.get('dph_total', 0):.3f}/hr")
@@ -295,14 +311,14 @@ class VastManager:
 
         # ── Container log ─────────────────────────────────────────────────
         if our_inst:
-            status = (our_inst.get("status") or "").lower()
-            if status in ("running", "loading", "provisioning", "starting", "created"):
+            cstatus = _get_status(our_inst)
+            if cstatus in ("running", "loading", "provisioning", "starting", "created"):
                 lines.append(f"── Container Log (last {log_tail} lines) {'─' * 18}")
                 lines.append(self.get_logs(our_inst, tail=log_tail))
             else:
                 lines.append(f"── Container Log {'─' * 38}")
                 lines.append(
-                    f"(container is '{our_inst.get('status', '?')}'"
+                    f"(container is {cstatus!r}"
                     " — logs only available when running)"
                 )
         else:
@@ -378,7 +394,7 @@ class VastManager:
         if inst is None:
             return "No instance found. Use Start (Cold) to provision one."
 
-        status = (inst.get("status") or "").lower()
+        status = _get_status(inst)
         if _STATUS_TO_STATE.get(status) == "standby":
             try:
                 self._vast.start_instance(id=inst["id"])
@@ -394,7 +410,7 @@ class VastManager:
             return "Instance is already running."
 
         return (
-            f"Cannot restart — instance is '{inst.get('status', '?')}'. "
+            f"Cannot restart — instance is {status!r}. "
             "Use Force Destroy if stuck."
         )
 
