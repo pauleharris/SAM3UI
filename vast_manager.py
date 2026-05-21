@@ -332,6 +332,7 @@ if [ ! -f /workspace/SAM3UI/.installed ]; then
     cd SAM3UI
 
     # torch already present in the devel image — just install app deps
+    pip install "numpy>=2.0.0" --upgrade -q  # force upgrade before requirements
     pip install -r requirements.txt -q
 
     # SAM3 from source
