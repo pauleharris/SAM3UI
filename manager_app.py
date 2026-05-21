@@ -338,13 +338,7 @@ def on_api_key_change(api_key):
 def build_ui() -> gr.Blocks:
     cfg = load_config()
 
-    with gr.Blocks(
-        title="SAM3UI — Instance Manager",
-        css="""
-        .status-panel { margin-bottom: 0 !important; }
-        .controls-row button { min-width: 130px; }
-        """,
-    ) as demo:
+    with gr.Blocks(title="SAM3UI — Instance Manager") as demo:
 
         # ── Header ───────────────────────────────────────────────────────────
         gr.Markdown(
@@ -502,5 +496,9 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=7861,       # 7860 is reserved for the remote app running on VAST
         theme=gr.themes.Soft(),
+        css="""
+        .status-panel { margin-bottom: 0 !important; }
+        .controls-row button { min-width: 130px; }
+        """,
         share=False,
     )
