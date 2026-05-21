@@ -229,6 +229,9 @@ class VastManager:
                 self.reset_activity()
                 return "Restarting from standby (~1-2 min until ready)."
             except Exception as exc:
+                err = str(exc)
+                if "No such container" in err or "no such container" in err:
+                    return "Host lost the container — use Force Destroy then Start (Cold)."
                 return f"Error restarting: {exc}"
 
         if status == "running":
@@ -248,6 +251,9 @@ class VastManager:
             self._vast.stop_instance(id=inst["id"])
             return "Stopping… disk preserved for fast restart."
         except Exception as exc:
+            err = str(exc)
+            if "No such container" in err or "no such container" in err:
+                return "Host lost the container — use Force Destroy then Start (Cold)."
             return f"Error stopping: {exc}"
 
     def destroy(self) -> str:
