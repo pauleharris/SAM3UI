@@ -362,6 +362,16 @@ class VastManager:
         hf_token:  str = "",
     ) -> str:
         """Find cheapest matching offer and create a new labeled instance."""
+        # Guard: refuse to create a second instance if one already exists.
+        existing = self.find_instance()
+        if existing is not None:
+            eid = existing.get("id")
+            est = _get_status(existing)
+            return (
+                f"Provision aborted — instance #{eid} already exists (status: {est!r}). "
+                "Use Force Destroy first if you want to start fresh."
+            )
+
         try:
             offers = self._vast.search_offers(query=gpu_query)
         except Exception as exc:
