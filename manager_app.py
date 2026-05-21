@@ -247,19 +247,22 @@ def build_iframe_html(url: Optional[str], state: str) -> str:
 # ── Gradio event handlers ────────────────────────────────────────────────────
 
 def _status_update(api_key: str):
-    """Common refresh — returns (status_html, iframe_html)."""
+    """Common refresh — returns (status_html, iframe_html, log_text)."""
     mgr = get_manager(api_key)
     if not mgr:
         return (
             build_status_html("cold", None, 0, None),
             build_iframe_html(None, "cold"),
+            "(no instance)",
         )
     state, inst = mgr.get_state()
     url         = mgr.get_gradio_url(inst) if inst else None
     countdown   = mgr.countdown_seconds()
+    logs        = mgr.get_logs(inst) if inst else "(no instance running)"
     return (
         build_status_html(state, inst, countdown, url),
         build_iframe_html(url, state),
+        logs,
     )
 
 
@@ -331,7 +334,6 @@ def on_reset_timer(api_key, *_):
 def on_api_key_change(api_key):
     """Immediately refresh status when the API key is entered."""
     return _status_update(api_key)
-
 
 # ── Gradio UI ────────────────────────────────────────────────────────────────
 
@@ -443,24 +445,36 @@ def build_ui() -> gr.Blocks:
             value=build_iframe_html(None, "cold"),
         )
 
+        # ── Live instance log ─────────────────────────────────────────────────
+        with gr.Accordion("📋 Instance Log (last 100 lines)", open=True):
+            instance_log = gr.Textbox(
+                label=None,
+                value="(no instance running)",
+                interactive=False,
+                lines=18,
+                max_lines=18,
+                elem_id="instance-log",
+                show_copy_button=True,
+            )
+
         # ── Timer (polls every 5 s) ──────────────────────────────────────────
         timer = gr.Timer(value=5)
 
         # ── Event wiring ──────────────────────────────────────────────────────
         all_cfg_inputs = [api_key, hf_token, gpu_query, disk_gb, docker_image]
 
-        # Refresh status + iframe on every timer tick
+        # Refresh status + iframe + log on every timer tick
         timer.tick(
             fn=on_timer_tick,
             inputs=[api_key],
-            outputs=[status_html, iframe_html],
+            outputs=[status_html, iframe_html, instance_log],
         )
 
         # Also refresh immediately when the API key is entered
         api_key.change(
             fn=on_api_key_change,
             inputs=[api_key],
-            outputs=[status_html, iframe_html],
+            outputs=[status_html, iframe_html, instance_log],
         )
 
         # Button actions — each returns a log message, then status refreshes
@@ -468,8 +482,8 @@ def build_ui() -> gr.Blocks:
             """Return a function that calls action_fn then refreshes status."""
             def _inner(*args):
                 msg = action_fn(*args)
-                status, iframe = _status_update(args[0])  # args[0] = api_key
-                return msg, status, iframe
+                status, iframe, logs = _status_update(args[0])  # args[0] = api_key
+                return msg, status, iframe, logs
             return _inner
 
         for btn, fn in [
@@ -482,7 +496,7 @@ def build_ui() -> gr.Blocks:
             btn.click(
                 fn=_wrap(fn),
                 inputs=all_cfg_inputs,
-                outputs=[action_log, status_html, iframe_html],
+                outputs=[action_log, status_html, iframe_html, instance_log],
             )
 
     return demo

@@ -151,6 +151,13 @@ class VastManager:
         except Exception:
             return False
 
+    def get_logs(self, inst: dict, tail: int = 100) -> str:
+        """Fetch the last *tail* lines of container logs for *inst*."""
+        try:
+            return self._vast.logs(instance_id=inst["id"], tail=str(tail)) or "(no output yet)"
+        except Exception as exc:
+            return f"(log fetch error: {exc})"
+
     # ── Lifecycle actions ────────────────────────────────────────────────────
 
     def provision(
