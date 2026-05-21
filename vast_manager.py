@@ -32,7 +32,7 @@ INSTANCE_LABEL   = "sam3ui"
 GRADIO_PORT      = 7860
 REPO_URL         = "https://github.com/pauleharris/SAM3UI.git"
 DEFAULT_IMAGE    = "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime"
-DEFAULT_GPU_QUERY = "gpu_name=RTX_3090 reliability>0.99 num_gpus=1 inet_up>300 cuda_vers>=12.0 direct_port_count>1"
+DEFAULT_GPU_QUERY = "gpu_ram>=24 dph_total<0.50 reliability>0.99 num_gpus=1 inet_up>300 cuda_vers>=12.0 direct_port_count>1"
 DEFAULT_DISK_GB  = 30
 SHUTDOWN_MINUTES = 5
 

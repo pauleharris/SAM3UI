@@ -373,7 +373,7 @@ def build_ui() -> gr.Blocks:
                 gpu_query = gr.Textbox(
                     label="GPU Offer Query",
                     value=cfg.get("gpu_query", DEFAULT_GPU_QUERY),
-                    info="VAST search query — see vast.ai/search for options",
+                    info="VAST search query — gpu_ram>=24 means 24 GB+ VRAM (3090 class and above); dph_total<0.50 caps cost at $0.50/hr",
                     scale=3,
                 )
                 disk_gb = gr.Number(
