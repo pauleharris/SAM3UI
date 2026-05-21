@@ -254,11 +254,15 @@ class VastManager:
         """Permanently destroy the instance and its disk."""
         inst = self.find_instance()
         if inst is None:
-            return "No instance found."
+            return "No instance found — already cold."
         try:
             self._vast.destroy_instance(id=inst["id"])
             return "Instance destroyed (COLD — full provisioning needed next time)."
         except Exception as exc:
+            err = str(exc)
+            # Container already gone on the host side — treat as destroyed
+            if "No such container" in err or "no such container" in err:
+                return "Instance already gone (COLD — full provisioning needed next time)."
             return f"Error destroying: {exc}"
 
     # ── Activity / countdown ─────────────────────────────────────────────────
