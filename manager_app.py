@@ -37,6 +37,7 @@ from vast_manager import (
     DEFAULT_IMAGE,
     SHUTDOWN_MINUTES,
     VastManager,
+    _get_status,
 )
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -157,7 +158,8 @@ def build_status_html(
         iid     = inst.get("id", "?")
         gpu     = f"{inst.get('num_gpus', 1)}× {inst.get('gpu_name', '?')}"
         cost    = f"${inst.get('dph_total', 0.0):.3f}/hr"
-        status  = inst.get("status", "?")
+        status  = _get_status(inst) or "?"
+
         url_tag = (
             f' &nbsp;·&nbsp; <span style="color:#6b7280;">URL:</span> '
             f'<a href="{url}" target="_blank" style="color:#60a5fa;">{url}</a>'

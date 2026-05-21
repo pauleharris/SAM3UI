@@ -385,6 +385,7 @@ class VastManager:
                 disk=disk_gb,
                 onstart_cmd=onstart,
                 label=INSTANCE_LABEL,
+                extra=f"-p {GRADIO_PORT}:{GRADIO_PORT}",
             )
         except Exception as exc:
             return f"Error creating instance: {exc}"
