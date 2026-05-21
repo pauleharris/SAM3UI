@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 INSTANCE_LABEL   = "sam3ui"
 GRADIO_PORT      = 7860
 REPO_URL         = "https://github.com/pauleharris/SAM3UI.git"
-DEFAULT_IMAGE    = "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime"
+DEFAULT_IMAGE    = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
 DEFAULT_GPU_QUERY = "gpu_ram>=24 dph_total<0.50 reliability>0.99 num_gpus=1 inet_up>300 cuda_vers>=12.0 direct_port_count>1"
 DEFAULT_DISK_GB  = 30
 SHUTDOWN_MINUTES = 5
@@ -291,33 +291,52 @@ class VastManager:
         so that restarting a STANDBY instance is fast (~30 s) vs cold start (~15 min).
         """
         return f"""#!/bin/bash
-set -euo pipefail
+# SAM3UI on-start script — runs once when the container starts.
+# Logs everything to /workspace/sam3ui_setup.log
+
+LOG=/workspace/sam3ui_setup.log
+exec > >(tee -a "$LOG") 2>&1
+
+log() {{ echo "[$(date '+%H:%M:%S')] $*"; }}
+
+log "=== SAM3UI on-start ==="
 
 # ── First-time installation (skipped on warm restart) ─────────────────────
 if [ ! -f /workspace/SAM3UI/.installed ]; then
-    echo "[SAM3UI] First-time setup starting…"
-    apt-get update -qq && apt-get install -y -qq git
+    log "Cold start — installing dependencies (this takes ~10-15 min)…"
+
+    apt-get update -qq
+    apt-get install -y -qq git curl
 
     cd /workspace
-    git clone {REPO_URL} SAM3UI
+    git clone {REPO_URL} SAM3UI || {{ log "ERROR: git clone failed"; exit 1; }}
     cd SAM3UI
 
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 -q
+    # torch already present in the devel image — just install app deps
     pip install -r requirements.txt -q
-    pip install git+https://github.com/facebookresearch/sam3.git -q
 
+    # SAM3 from source
+    pip install git+https://github.com/facebookresearch/sam3.git -q \
+        || log "WARNING: sam3 pip install failed — app will show an error but will still start"
+
+    # Download model checkpoint
+    export HF_TOKEN="{hf_token}"
     export HUGGING_FACE_HUB_TOKEN="{hf_token}"
     mkdir -p checkpoints
-    huggingface-cli download facebook/sam3-large --local-dir checkpoints/
+    huggingface-cli download facebook/sam3-large --local-dir checkpoints/ \
+        || log "WARNING: HF download failed — check your token and model access"
 
     touch /workspace/SAM3UI/.installed
-    echo "[SAM3UI] Installation complete."
+    log "Installation complete."
 else
-    echo "[SAM3UI] Warm restart — skipping installation."
+    log "Warm restart — skipping installation."
 fi
 
 # ── Launch the Gradio app ──────────────────────────────────────────────────
 cd /workspace/SAM3UI
-nohup python app.py > /workspace/sam3ui.log 2>&1 &
-echo "[SAM3UI] app.py launched. Tail /workspace/sam3ui.log for progress."
+APP_LOG=/workspace/sam3ui.log
+log "Launching app.py — output in $APP_LOG"
+nohup python app.py > "$APP_LOG" 2>&1 &
+APP_PID=$!
+log "app.py started (PID $APP_PID). Setup complete."
 """
