@@ -1,8 +1,8 @@
 """
-app.py — SAM 3 Gradio Application
-───────────────────────────────────
-Runs Meta's SAM 3 text-prompted image segmentation on images stored in any
-S3-compatible object store (AWS S3, MinIO, Cloudflare R2, Backblaze B2 …).
+app.py — Grounded SAM Gradio Application
+─────────────────────────────────────────
+Runs text-prompted image segmentation (Grounding DINO → SAM) on images stored
+in any S3-compatible object store (AWS S3, MinIO, Cloudflare R2, Backblaze B2).
 
 Usage:
     python app.py
@@ -11,10 +11,10 @@ The app will be available at http://0.0.0.0:7860 (or the machine's public IP
 when deployed on VAST.AI or similar GPU cloud services).
 
 Environment variables (optional overrides):
-    SAM3_CHECKPOINT   Path to the SAM 3 .pt checkpoint file.
-                      Default: checkpoints/sam3_l.pt
-    SAM3_MODEL_CFG    Model configuration name passed to build_sam3_image_model.
-                      Default: sam3_l
+    GDINO_MODEL   HuggingFace model ID for Grounding DINO text detector.
+                  Default: IDEA-Research/grounding-dino-base
+    SAM_MODEL     HuggingFace model ID for SAM segmentation model.
+                  Default: facebook/sam-vit-large
 """
 
 from __future__ import annotations
@@ -69,48 +69,141 @@ _SAM3_PROCESSOR = None
 _MODEL_LOAD_ERROR: str | None = None  # human-readable error if loading failed
 
 
+class GroundedSamProcessor:
+    """
+    Wraps Grounding DINO (text → boxes) + SAM (boxes → masks) into a single
+    processor that matches the ``processor.predict(image, text)`` interface
+    expected by ``run_sam3_inference`` in utils.py.
+    """
+
+    def __init__(self, gdino_model, gdino_proc, sam_model, sam_proc, device: str):
+        self.gdino_model = gdino_model
+        self.gdino_proc  = gdino_proc
+        self.sam_model   = sam_model
+        self.sam_proc    = sam_proc
+        self.device      = device
+
+    def predict(
+        self,
+        image,
+        text: str,
+        box_threshold: float = 0.3,
+        text_threshold: float = 0.25,
+    ) -> dict:
+        import torch
+
+        # ── Step 1: Grounding DINO — text → bounding boxes ──────────────────
+        gdino_inputs = self.gdino_proc(
+            images=image,
+            text=text,
+            return_tensors="pt",
+        ).to(self.device)
+
+        with torch.no_grad():
+            gdino_outputs = self.gdino_model(**gdino_inputs)
+
+        w, h = image.size
+        results = self.gdino_proc.post_process_grounded_object_detection(
+            gdino_outputs,
+            gdino_inputs["input_ids"],
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+            target_sizes=[(h, w)],
+        )[0]
+
+        boxes  = results["boxes"]   # tensor [N, 4] xyxy pixel coords
+        scores = results["scores"]  # tensor [N]
+        labels = results["labels"]  # list of str
+
+        if boxes.shape[0] == 0:
+            return {"masks": [], "scores": [], "boxes": [], "labels": []}
+
+        # ── Step 2: SAM — boxes → segmentation masks ────────────────────────
+        boxes_list = boxes.cpu().numpy().tolist()
+        sam_inputs = self.sam_proc(
+            images=image,
+            input_boxes=[[boxes_list]],   # shape: [batch=1, N_boxes, 4]
+            return_tensors="pt",
+        ).to(self.device)
+
+        with torch.no_grad():
+            sam_outputs = self.sam_model(**sam_inputs)
+
+        # post_process_masks → list of (N_boxes, 3, H, W) tensors
+        masks = self.sam_proc.image_processor.post_process_masks(
+            sam_outputs.pred_masks.cpu(),
+            sam_inputs["original_sizes"].cpu(),
+            sam_inputs["reshaped_input_sizes"].cpu(),
+        )[0]  # (N_boxes, 3, H, W)
+
+        # Pick the highest-IoU mask candidate per box
+        iou_scores = sam_outputs.iou_scores.cpu()  # (1, N_boxes, 3)
+        best_idx   = iou_scores[0].argmax(dim=-1)  # (N_boxes,)
+        best_masks = torch.stack(
+            [masks[i, best_idx[i]] for i in range(masks.shape[0])]
+        )  # (N_boxes, H, W) bool
+
+        return {
+            "masks":  best_masks.numpy(),
+            "scores": scores.cpu().numpy().tolist(),
+            "boxes":  boxes.cpu().numpy().tolist(),
+            "labels": labels,
+        }
+
+
 def load_sam3_model() -> None:
     """
-    Import SAM 3, build the image model, and wrap it in a Sam3Processor.
-
-    Call once at startup.  Sets the module-level _SAM3_PROCESSOR on success,
-    or _MODEL_LOAD_ERROR on failure.
+    Load Grounding DINO and SAM from HuggingFace Hub, then wrap them in a
+    GroundedSamProcessor.  Sets _SAM3_PROCESSOR on success or _MODEL_LOAD_ERROR
+    on failure.
     """
     global _SAM3_PROCESSOR, _MODEL_LOAD_ERROR
 
-    model_cfg = os.environ.get("SAM3_MODEL_CFG", "sam3_l")
-    checkpoint = os.environ.get("SAM3_CHECKPOINT", "checkpoints/sam3_l.pt")
+    gdino_model_id = os.environ.get("GDINO_MODEL", "IDEA-Research/grounding-dino-base")
+    sam_model_id   = os.environ.get("SAM_MODEL",   "facebook/sam-vit-large")
 
-    logger.info("Loading SAM 3 model cfg=%s checkpoint=%s …", model_cfg, checkpoint)
+    logger.info("Loading Grounding DINO: %s", gdino_model_id)
+    logger.info("Loading SAM: %s", sam_model_id)
 
     try:
-        from sam3 import Sam3Processor, build_sam3_image_model  # type: ignore[import]
+        from transformers import (  # type: ignore[import]
+            AutoModelForZeroShotObjectDetection,
+            AutoProcessor,
+            SamModel,
+            SamProcessor,
+        )
     except ImportError:
         _MODEL_LOAD_ERROR = (
-            "SAM 3 is not installed.  Run:\n"
-            "  pip install git+https://github.com/facebookresearch/sam3.git\n"
-            "and download a checkpoint.  See README for details."
-        )
-        logger.error(_MODEL_LOAD_ERROR)
-        return
-
-    if not Path(checkpoint).is_file():
-        _MODEL_LOAD_ERROR = (
-            f"Checkpoint not found: {checkpoint}\n"
-            "Set the SAM3_CHECKPOINT environment variable to the correct path.\n"
-            "See README for download instructions."
+            "transformers is not installed.  Run:\n"
+            "  pip install transformers>=4.45.0 accelerate\n"
         )
         logger.error(_MODEL_LOAD_ERROR)
         return
 
     try:
-        model = build_sam3_image_model(model_cfg, checkpoint)
-        model = model.to(DEVICE).eval()
-        _SAM3_PROCESSOR = Sam3Processor(model)
-        logger.info("SAM 3 model ready ✓")
+        gdino_proc  = AutoProcessor.from_pretrained(gdino_model_id)
+        gdino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
+            gdino_model_id
+        ).to(DEVICE).eval()
+        logger.info("Grounding DINO loaded ✓")
     except Exception as exc:
-        _MODEL_LOAD_ERROR = f"Failed to load SAM 3 model: {exc}"
+        _MODEL_LOAD_ERROR = f"Failed to load Grounding DINO ({gdino_model_id}): {exc}"
         logger.exception(_MODEL_LOAD_ERROR)
+        return
+
+    try:
+        sam_proc  = SamProcessor.from_pretrained(sam_model_id)
+        sam_model = SamModel.from_pretrained(sam_model_id).to(DEVICE).eval()
+        logger.info("SAM loaded ✓")
+    except Exception as exc:
+        _MODEL_LOAD_ERROR = f"Failed to load SAM ({sam_model_id}): {exc}"
+        logger.exception(_MODEL_LOAD_ERROR)
+        return
+
+    _SAM3_PROCESSOR = GroundedSamProcessor(
+        gdino_model, gdino_proc, sam_model, sam_proc, DEVICE
+    )
+    logger.info("Models ready ✓")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,13 +391,13 @@ def build_ui() -> gr.Blocks:
     """Construct and return the Gradio Blocks application."""
 
     with gr.Blocks(
-        title="SAM 3 — S3 Image Segmentation",
+        title="SAM — S3 Image Segmentation",
     ) as demo:
 
         # ── Header ───────────────────────────────────────────────────────────
         gr.Markdown(
-            "# SAM 3 — S3 Image Segmentation\n"
-            "Run Meta's **SAM 3** text-prompted segmentation on every image "
+            "# SAM — S3 Image Segmentation\n"
+            "Run text-prompted segmentation (**Grounding DINO + SAM**) on every image "
             "in an S3-compatible bucket."
         )
 

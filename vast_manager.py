@@ -335,17 +335,23 @@ if [ ! -f /workspace/SAM3UI/.installed ]; then
     pip install "numpy>=2.0.0" --upgrade -q  # force upgrade before requirements
     pip install -r requirements.txt -q
 
-    # SAM3 from source
-    pip install git+https://github.com/facebookresearch/sam3.git -q \
-        || log "WARNING: sam3 pip install failed — app will show an error but will still start"
-
-    # Download model checkpoint
+    # Pre-cache models from HuggingFace Hub so first inference is instant
     export HF_TOKEN="{hf_token}"
     export HUGGING_FACE_HUB_TOKEN="{hf_token}"
-    mkdir -p checkpoints
-    # Use 'hf' CLI (huggingface-cli is deprecated in newer hf_hub versions)
-    hf download facebook/sam3-large --local-dir checkpoints/ \
-        || log "WARNING: HF download failed — check your token and model access"
+    log "Pre-caching Grounding DINO model…"
+    python -c "
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+AutoProcessor.from_pretrained('IDEA-Research/grounding-dino-base')
+AutoModelForZeroShotObjectDetection.from_pretrained('IDEA-Research/grounding-dino-base')
+print('Grounding DINO cached')
+" || log "WARNING: Grounding DINO pre-cache failed — will download on first use"
+    log "Pre-caching SAM model…"
+    python -c "
+from transformers import SamModel, SamProcessor
+SamProcessor.from_pretrained('facebook/sam-vit-large')
+SamModel.from_pretrained('facebook/sam-vit-large')
+print('SAM cached')
+" || log "WARNING: SAM pre-cache failed — will download on first use"
 
     touch /workspace/SAM3UI/.installed
     log "Installation complete."
