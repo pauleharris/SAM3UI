@@ -44,6 +44,8 @@ SHUTDOWN_MINUTES  = 5
 # Any status NOT in this dict returns "unknown" — never silently "starting".
 
 _STATUS_TO_STATE: dict[str, str] = {
+    # ── No status yet — container still being allocated by VAST ──────────
+    "":              "starting",
     # ── Terminal / gone ───────────────────────────────────────────────────
     "destroyed":    "cold",
     "delerr":       "cold",
@@ -292,7 +294,12 @@ class VastManager:
                 logical   = mapped.upper()
 
             lines.append(f"│  Our instance #{our_inst.get('id')}:")
-            lines.append(f"│    VAST status   : {vast_status!r}")
+            raw_actual   = our_inst.get("actual_status")
+            raw_cur      = our_inst.get("cur_state")
+            raw_intended = our_inst.get("intended_status")
+            lines.append(f"│    actual_status : {raw_actual!r}")
+            lines.append(f"│    cur_state     : {raw_cur!r}")
+            lines.append(f"│    intended      : {raw_intended!r}")
             lines.append(f"│    Logical state : {logical}")
             lines.append(f"│    GPU           : {our_inst.get('num_gpus', 1)}× {our_inst.get('gpu_name', '?')}")
             lines.append(f"│    Cost          : ${our_inst.get('dph_total', 0):.3f}/hr")
