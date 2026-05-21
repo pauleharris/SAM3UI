@@ -43,7 +43,7 @@ STATES = ("cold", "standby", "starting", "ready", "stopping", "error")
 # VAST status strings that map to each of our logical states
 _VAST_STATUS_MAP = {
     "cold":     {"destroyed", "delerr", "failed"},
-    "standby":  {"stopped", "exited"},
+    "standby":  {"stopped", "exited", "hibernated", "hibernate"},  # hibernated = VAST suspend
     "starting": {"loading", "running", "provisioning"},  # running but Gradio not up
     "stopping": {"stopping"},
 }
@@ -223,7 +223,7 @@ class VastManager:
             return "No instance found. Use Start (Cold) to provision one."
 
         status = inst.get("status", "").lower()
-        if status in ("stopped", "exited"):
+        if status in ("stopped", "exited", "hibernated", "hibernate"):
             try:
                 self._vast.start_instance(id=inst["id"])
                 self.reset_activity()
