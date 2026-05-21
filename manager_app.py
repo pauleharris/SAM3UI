@@ -454,7 +454,6 @@ def build_ui() -> gr.Blocks:
                 lines=18,
                 max_lines=18,
                 elem_id="instance-log",
-                show_copy_button=True,
             )
 
         # ── Timer (polls every 5 s) ──────────────────────────────────────────
