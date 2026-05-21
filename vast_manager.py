@@ -385,7 +385,7 @@ class VastManager:
                 disk=disk_gb,
                 onstart_cmd=onstart,
                 label=INSTANCE_LABEL,
-                extra=f"-p {GRADIO_PORT}:{GRADIO_PORT}",
+                env={f"-p {GRADIO_PORT}:{GRADIO_PORT}": "1"},
             )
         except Exception as exc:
             return f"Error creating instance: {exc}"
@@ -516,7 +516,13 @@ if [ ! -f /workspace/SAM3UI/.installed ]; then
     apt-get install -y -qq git curl
 
     cd /workspace
-    git clone {REPO_URL} SAM3UI || {{ log "ERROR: git clone failed"; exit 1; }}
+    for attempt in 1 2 3 4 5; do
+        git clone {REPO_URL} SAM3UI && break
+        log "git clone attempt $attempt failed — retrying in 20s…"
+        rm -rf SAM3UI
+        sleep 20
+    done
+    [ -d SAM3UI ] || {{ log "ERROR: git clone failed after 5 attempts"; exit 1; }}
     cd SAM3UI
 
     # torch already present in the devel image — just install app deps
