@@ -32,7 +32,7 @@ INSTANCE_LABEL   = "sam3ui"
 GRADIO_PORT      = 7860
 REPO_URL         = "https://github.com/pauleharris/SAM3UI.git"
 DEFAULT_IMAGE    = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
-DEFAULT_GPU_QUERY = "gpu_ram>=24 dph_total<0.50 reliability>0.99 num_gpus=1 inet_up>300 cuda_vers>=12.0 direct_port_count>1"
+DEFAULT_GPU_QUERY = "gpu_ram>=24 dph_total<0.50 reliability>0.995 num_gpus=1 inet_up>500 cuda_vers>=12.0 direct_port_count>2"
 DEFAULT_DISK_GB  = 30
 SHUTDOWN_MINUTES = 5
 
@@ -152,11 +152,23 @@ class VastManager:
             return False
 
     def get_logs(self, inst: dict, tail: int = 100) -> str:
-        """Fetch the last *tail* lines of container logs for *inst*."""
+        """Fetch the last *tail* lines of container logs, filtering VAST noise."""
         try:
-            return self._vast.logs(instance_id=inst["id"], tail=str(tail)) or "(no output yet)"
+            raw = self._vast.logs(instance_id=inst["id"], tail=str(tail)) or ""
         except Exception as exc:
             return f"(log fetch error: {exc})"
+
+        # Strip VAST's port-forwarding spam and SSH noise — we only want our output
+        _NOISE = (
+            "remote port forwarding failed",
+            "Warning: Permanently added",
+            "Server listening on",
+            "invoke-rc.d:",
+            "debconf:",
+            "policy-rc.d denied",
+        )
+        lines = [l for l in raw.splitlines() if not any(n in l for n in _NOISE)]
+        return "\n".join(lines) if lines else "(no output yet)"
 
     # ── Lifecycle actions ────────────────────────────────────────────────────
 
