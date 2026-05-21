@@ -185,9 +185,8 @@ class VastManager:
                 id=offer_id,
                 image=image,
                 disk=disk_gb,
-                onstart=onstart,
+                onstart_cmd=onstart,
                 label=INSTANCE_LABEL,
-                ports=str(GRADIO_PORT),
             )
         except Exception as exc:
             return f"Error creating instance: {exc}"
