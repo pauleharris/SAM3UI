@@ -1,18 +1,19 @@
 """
 vast_manager.py — VAST.AI instance lifecycle manager for SAM3UI
 ────────────────────────────────────────────────────────────────
-Manages the full state machine for a labeled VAST.AI instance:
+State machine:
 
-  COLD       No instance exists. Provisioning required (5-15 min cold start).
-  STANDBY    Instance exists but is stopped. Disk preserved; fast restart (~1-2 min).
-  STARTING   Instance is running but Gradio is not yet responding.
-  READY      Gradio is accessible — SAM3 is live.
-  STOPPING   Instance is being stopped.
+  COLD       No instance exists (or in terminal failure state).
+  STANDBY    Instance exists but container is stopped. Disk preserved.
+  STARTING   Container is running but Gradio not yet responding.
+  READY      Gradio is accessible — SAM is live.
+  STOPPING   Container is tearing down.
+  UNKNOWN    VAST returned a status string we have not seen before.
+  ERROR      Could not reach the VAST API.
 
 Auto-shutdown:
-  A background daemon thread monitors the inactivity timer. When the countdown
-  reaches zero while the state is READY, the instance is stopped (not destroyed),
-  leaving it in STANDBY for a fast restart next time.
+  A background daemon stops the instance after SHUTDOWN_MINUTES of inactivity,
+  leaving it in STANDBY for a fast restart.
 """
 
 from __future__ import annotations
@@ -28,46 +29,61 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-INSTANCE_LABEL   = "sam3ui"
-GRADIO_PORT      = 7860
-REPO_URL         = "https://github.com/pauleharris/SAM3UI.git"
-DEFAULT_IMAGE    = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
-DEFAULT_GPU_QUERY = "gpu_ram>=24 dph_total<0.50 reliability>0.995 num_gpus=1 inet_up>500 cuda_vers>=12.0 direct_port_count>2"
-DEFAULT_DISK_GB  = 30
-SHUTDOWN_MINUTES = 5
+INSTANCE_LABEL    = "sam3ui"
+GRADIO_PORT       = 7860
+REPO_URL          = "https://github.com/pauleharris/SAM3UI.git"
+DEFAULT_IMAGE     = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
+DEFAULT_GPU_QUERY = (
+    "gpu_ram>=24 dph_total<0.50 reliability>0.995 num_gpus=1 "
+    "inet_up>500 cuda_vers>=12.0 direct_port_count>2"
+)
+DEFAULT_DISK_GB   = 30
+SHUTDOWN_MINUTES  = 5
 
-# ── State definitions ─────────────────────────────────────────────────────────
+# ── Comprehensive VAST status → logical state map ─────────────────────────────
+# Any status NOT in this dict returns "unknown" — never silently "starting".
 
-STATES = ("cold", "standby", "starting", "ready", "stopping", "error")
-
-# VAST status strings that map to each of our logical states
-_VAST_STATUS_MAP = {
-    "cold":     {"destroyed", "delerr", "failed"},
-    "standby":  {"stopped", "exited", "hibernated", "hibernate"},  # hibernated = VAST suspend
-    "starting": {"loading", "running", "provisioning"},  # running but Gradio not up
-    "stopping": {"stopping"},
+_STATUS_TO_STATE: dict[str, str] = {
+    # ── Terminal / gone ───────────────────────────────────────────────────
+    "destroyed":    "cold",
+    "delerr":       "cold",
+    "delunable":    "cold",
+    "failed":       "cold",
+    "error":        "cold",
+    # ── Container exists but stopped ──────────────────────────────────────
+    "stopped":      "standby",
+    "exited":       "standby",
+    "hibernated":   "standby",
+    "hibernate":    "standby",
+    "paused":       "standby",
+    "suspended":    "standby",
+    # ── Container coming up ───────────────────────────────────────────────
+    "provisioning": "starting",
+    "loading":      "starting",
+    "starting":     "starting",
+    "created":      "starting",
+    # ── Container tearing down ────────────────────────────────────────────
+    "stopping":     "stopping",
+    "destroying":   "stopping",
+    # ── Container running — must verify Gradio ────────────────────────────
+    "running":      "_check_gradio",
 }
+
+STATES = ("cold", "standby", "starting", "ready", "stopping", "unknown", "error")
 
 
 class VastManager:
     """
     Manages a single labeled VAST.AI instance through its lifecycle.
-
     Thread-safe: all public methods can be called from Gradio event handlers
     or the background monitor simultaneously.
     """
 
-    def __init__(
-        self,
-        api_key: str,
-        shutdown_minutes: int = SHUTDOWN_MINUTES,
-    ) -> None:
+    def __init__(self, api_key: str, shutdown_minutes: int = SHUTDOWN_MINUTES) -> None:
         try:
-            from vastai import VastAI
+            from vastai import VastAI  # type: ignore[import]
         except ImportError:
-            raise ImportError(
-                "vastai is not installed.  Run:  pip install vastai"
-            )
+            raise ImportError("vastai is not installed.  Run:  pip install vastai")
 
         self.api_key          = api_key.strip()
         self.shutdown_seconds = shutdown_minutes * 60
@@ -81,13 +97,41 @@ class VastManager:
         self._monitor_thread.start()
         logger.info("VastManager initialised (shutdown after %d min inactivity)", shutdown_minutes)
 
-    # ── Instance discovery ───────────────────────────────────────────────────
+    # ── Raw API helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_instances(raw) -> list[dict]:
+        """
+        Normalize whatever show_instances() returns into a plain list of dicts.
+
+        The vastai SDK has returned different shapes across versions:
+          list of dicts | dict with "instances" key | iterator | None
+        """
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return [x for x in raw if isinstance(x, dict)]
+        if isinstance(raw, dict):
+            for key in ("instances", "results", "data"):
+                if key in raw and isinstance(raw[key], list):
+                    return [x for x in raw[key] if isinstance(x, dict)]
+            return []
+        try:
+            return [x for x in raw if isinstance(x, dict)]
+        except Exception:
+            return []
+
+    def show_all_instances(self) -> list[dict]:
+        """Return every VAST instance on this account. Raises on API error."""
+        raw = self._vast.show_instances()
+        return self._parse_instances(raw)
+
+    # ── Instance discovery ────────────────────────────────────────────────────
 
     def find_instance(self) -> Optional[dict]:
-        """Return the dict for our labeled instance, or None."""
+        """Return the dict for our labeled instance, or None if not found."""
         try:
-            instances = self._vast.show_instances() or []
-            for inst in instances:
+            for inst in self.show_all_instances():
                 if inst.get("label") == INSTANCE_LABEL:
                     return inst
         except Exception as exc:
@@ -98,7 +142,8 @@ class VastManager:
         """
         Poll VAST and return (state, instance_dict).
 
-        State is one of: cold | standby | starting | ready | stopping | error
+        state is one of: cold | standby | starting | ready | stopping | unknown | error
+        instance_dict is None when state is cold or error.
         """
         try:
             inst = self.find_instance()
@@ -109,47 +154,162 @@ class VastManager:
         if inst is None:
             return "cold", None
 
-        vast_status = inst.get("status", "").lower()
+        vast_status = (inst.get("status") or "").lower().strip()
+        mapped = _STATUS_TO_STATE.get(vast_status)
 
-        if vast_status in _VAST_STATUS_MAP["cold"]:
-            return "cold", None  # treat as if no instance
+        if mapped is None:
+            logger.warning(
+                "Unknown VAST status %r for instance %s — showing UNKNOWN",
+                vast_status, inst.get("id"),
+            )
+            return "unknown", inst
 
-        if vast_status in _VAST_STATUS_MAP["standby"]:
-            return "standby", inst
+        if mapped == "cold":
+            return "cold", None   # terminal state — treat as no instance
 
-        if vast_status in _VAST_STATUS_MAP["stopping"]:
-            return "stopping", inst
+        if mapped in ("standby", "stopping", "starting"):
+            return mapped, inst
 
-        # Instance reports "running" — check whether Gradio is actually up
-        if vast_status == "running":
+        if mapped == "_check_gradio":
             url = self.get_gradio_url(inst)
             if url and self._check_url(url):
                 return "ready", inst
             return "starting", inst
 
-        # loading / provisioning / anything else → still starting
-        return "starting", inst
+        return "unknown", inst  # should not reach here
 
-    # ── URL helpers ──────────────────────────────────────────────────────────
+    # ── URL helpers ───────────────────────────────────────────────────────────
 
     def get_gradio_url(self, inst: dict) -> Optional[str]:
-        """Extract the public Gradio URL from the VAST port mapping."""
-        ports = inst.get("ports") or {}
-        mappings = ports.get(f"{GRADIO_PORT}/tcp") or []
-        if mappings:
-            host_port = mappings[0].get("HostPort")
-            public_ip = inst.get("public_ipaddr", "").strip()
-            if host_port and public_ip:
+        """
+        Extract the public Gradio URL from the VAST port mapping.
+        Tries both "7860/tcp" and "7860" as keys, and multiple casing variants.
+        """
+        ports     = inst.get("ports") or {}
+        public_ip = (inst.get("public_ipaddr") or "").strip()
+        if not public_ip:
+            return None
+
+        for key in (f"{GRADIO_PORT}/tcp", str(GRADIO_PORT)):
+            mappings = ports.get(key)
+            if not mappings:
+                continue
+            entry = mappings[0] if isinstance(mappings, list) else mappings
+            if isinstance(entry, dict):
+                host_port = (
+                    entry.get("HostPort") or entry.get("hostPort") or
+                    entry.get("host_port") or entry.get("port") or ""
+                )
+            else:
+                host_port = str(entry)
+            if host_port:
                 return f"http://{public_ip}:{host_port}"
         return None
 
     def _check_url(self, url: str, timeout: float = 3.0) -> bool:
-        """Return True if the URL returns HTTP 200."""
+        """Return True if the URL responds with HTTP 2xx."""
         try:
             r = httpx.get(url, timeout=timeout, follow_redirects=True)
-            return r.status_code == 200
+            return r.status_code < 400
         except Exception:
             return False
+
+    # ── Diagnostics ───────────────────────────────────────────────────────────
+
+    def get_diagnostics(self, log_tail: int = 60) -> str:
+        """
+        Return a rich diagnostic string for the Instance Log panel showing:
+          1. All VAST instances with their raw status strings
+          2. Our instance: state mapping, URL, Gradio reachability, raw ports
+          3. Container log (last log_tail lines — only when container is running)
+        """
+        SEP   = "─" * 56
+        lines: list[str] = []
+
+        # ── All instances ─────────────────────────────────────────────────
+        lines.append(f"┌ {SEP}")
+        lines.append("│  VAST.AI LIVE STATUS")
+        lines.append(f"│  {SEP}")
+
+        our_inst: Optional[dict] = None
+        api_error: Optional[str] = None
+
+        try:
+            all_insts = self.show_all_instances()
+            lines.append(f"│  show_instances() → {len(all_insts)} total instance(s)")
+            lines.append("│")
+            if all_insts:
+                for inst in all_insts:
+                    iid    = inst.get("id", "?")
+                    lbl    = inst.get("label") or "(no label)"
+                    status = inst.get("status", "?")
+                    gpu    = inst.get("gpu_name", "?")
+                    cost   = f"${inst.get('dph_total', 0):.3f}/hr"
+                    marker = "  ◄ OUR INSTANCE" if lbl == INSTANCE_LABEL else ""
+                    lines.append(
+                        f"│  #{iid}  [{status}]  {gpu}  {cost}"
+                        f"  label={lbl!r}{marker}"
+                    )
+                    if lbl == INSTANCE_LABEL:
+                        our_inst = inst
+            else:
+                lines.append("│  (no instances on this account)")
+        except Exception as exc:
+            api_error = str(exc)
+            lines.append(f"│  ERROR calling show_instances(): {exc}")
+
+        # ── Our instance detail ───────────────────────────────────────────
+        lines.append("│")
+        if our_inst:
+            vast_status = (our_inst.get("status") or "").lower().strip()
+            mapped      = _STATUS_TO_STATE.get(vast_status, "unknown")
+            url         = self.get_gradio_url(our_inst)
+
+            if mapped == "_check_gradio":
+                gradio_up = bool(url and self._check_url(url))
+                logical   = "READY" if gradio_up else "STARTING (waiting for Gradio)"
+            elif mapped == "cold":
+                gradio_up = False
+                logical   = "COLD (terminal — treating as no instance)"
+            else:
+                gradio_up = False
+                logical   = mapped.upper()
+
+            lines.append(f"│  Our instance #{our_inst.get('id')}:")
+            lines.append(f"│    VAST status   : {our_inst.get('status', '?')!r}")
+            lines.append(f"│    Logical state : {logical}")
+            lines.append(f"│    GPU           : {our_inst.get('num_gpus', 1)}× {our_inst.get('gpu_name', '?')}")
+            lines.append(f"│    Cost          : ${our_inst.get('dph_total', 0):.3f}/hr")
+            lines.append(f"│    Gradio URL    : {url or '(no port mapping yet)'}")
+            if url:
+                lines.append(
+                    f"│    Gradio alive  : {'YES ✓' if gradio_up else 'NO (not responding yet)'}"
+                )
+            raw_ports = our_inst.get("ports") or {}
+            lines.append(f"│    Raw ports     : {raw_ports if raw_ports else '(empty)'}")
+        elif not api_error:
+            lines.append(f"│  No instance with label {INSTANCE_LABEL!r} found.")
+
+        lines.append(f"└ {SEP}")
+        lines.append("")
+
+        # ── Container log ─────────────────────────────────────────────────
+        if our_inst:
+            status = (our_inst.get("status") or "").lower()
+            if status in ("running", "loading", "provisioning", "starting", "created"):
+                lines.append(f"── Container Log (last {log_tail} lines) {'─' * 18}")
+                lines.append(self.get_logs(our_inst, tail=log_tail))
+            else:
+                lines.append(f"── Container Log {'─' * 38}")
+                lines.append(
+                    f"(container is '{our_inst.get('status', '?')}'"
+                    " — logs only available when running)"
+                )
+        else:
+            lines.append(f"── Container Log {'─' * 38}")
+            lines.append("(no instance)")
+
+        return "\n".join(lines)
 
     def get_logs(self, inst: dict, tail: int = 100) -> str:
         """Fetch the last *tail* lines of container logs, filtering VAST noise."""
@@ -158,7 +318,6 @@ class VastManager:
         except Exception as exc:
             return f"(log fetch error: {exc})"
 
-        # Strip VAST's port-forwarding spam and SSH noise — we only want our output
         _NOISE = (
             "remote port forwarding failed",
             "Warning: Permanently added",
@@ -167,29 +326,26 @@ class VastManager:
             "debconf:",
             "policy-rc.d denied",
         )
-        lines = [l for l in raw.splitlines() if not any(n in l for n in _NOISE)]
+        lines = [ln for ln in raw.splitlines() if not any(n in ln for n in _NOISE)]
         return "\n".join(lines) if lines else "(no output yet)"
 
-    # ── Lifecycle actions ────────────────────────────────────────────────────
+    # ── Lifecycle actions ─────────────────────────────────────────────────────
 
     def provision(
         self,
-        gpu_query:  str = DEFAULT_GPU_QUERY,
-        image:      str = DEFAULT_IMAGE,
-        disk_gb:    int = DEFAULT_DISK_GB,
-        hf_token:   str = "",
+        gpu_query: str = DEFAULT_GPU_QUERY,
+        image:     str = DEFAULT_IMAGE,
+        disk_gb:   int = DEFAULT_DISK_GB,
+        hf_token:  str = "",
     ) -> str:
-        """
-        Find the cheapest offer matching *gpu_query* and create a new instance.
-        The on-start script installs SAM3 and launches app.py.
-        """
+        """Find cheapest matching offer and create a new labeled instance."""
         try:
             offers = self._vast.search_offers(query=gpu_query)
         except Exception as exc:
             return f"Error searching offers: {exc}"
 
         if not offers:
-            return f"No offers found for query: '{gpu_query}'. Try broadening the search."
+            return f"No offers found for: '{gpu_query}'. Try broadening the search."
 
         cheapest = min(offers, key=lambda o: o.get("dph_total", 9999.0))
         offer_id = cheapest["id"]
@@ -212,8 +368,8 @@ class VastManager:
 
         self.reset_activity()
         return (
-            f"Instance provisioning started — {gpu}, ${cost:.3f}/hr. "
-            f"Expect 5-15 min for first-time setup."
+            f"Provisioning started — {gpu}, ${cost:.3f}/hr. "
+            "Expect 10-15 min for first-time setup."
         )
 
     def start(self) -> str:
@@ -222,28 +378,28 @@ class VastManager:
         if inst is None:
             return "No instance found. Use Start (Cold) to provision one."
 
-        status = inst.get("status", "").lower()
-        if status in ("stopped", "exited", "hibernated", "hibernate"):
+        status = (inst.get("status") or "").lower()
+        if _STATUS_TO_STATE.get(status) == "standby":
             try:
                 self._vast.start_instance(id=inst["id"])
                 self.reset_activity()
                 return "Restarting from standby (~1-2 min until ready)."
             except Exception as exc:
                 err = str(exc)
-                if "No such container" in err or "no such container" in err:
+                if "no such container" in err.lower():
                     return "Host lost the container — use Force Destroy then Start (Cold)."
                 return f"Error restarting: {exc}"
 
         if status == "running":
             return "Instance is already running."
 
-        return f"Instance is in state '{status}' — cannot restart."
+        return (
+            f"Cannot restart — instance is '{inst.get('status', '?')}'. "
+            "Use Force Destroy if stuck."
+        )
 
     def stop(self) -> str:
-        """
-        Stop the running instance.
-        Disk is preserved so it can be restarted quickly (STANDBY state).
-        """
+        """Stop the running instance (disk preserved → STANDBY)."""
         inst = self.find_instance()
         if inst is None:
             return "No running instance found."
@@ -252,12 +408,12 @@ class VastManager:
             return "Stopping… disk preserved for fast restart."
         except Exception as exc:
             err = str(exc)
-            if "No such container" in err or "no such container" in err:
+            if "no such container" in err.lower():
                 return "Host lost the container — use Force Destroy then Start (Cold)."
             return f"Error stopping: {exc}"
 
     def destroy(self) -> str:
-        """Permanently destroy the instance and its disk."""
+        """Permanently destroy the instance and its disk (→ COLD)."""
         inst = self.find_instance()
         if inst is None:
             return "No instance found — already cold."
@@ -266,9 +422,8 @@ class VastManager:
             return "Instance destroyed (COLD — full provisioning needed next time)."
         except Exception as exc:
             err = str(exc)
-            # Container already gone on the host side — treat as destroyed
-            if "No such container" in err or "no such container" in err:
-                return "Instance already gone (COLD — full provisioning needed next time)."
+            if "no such container" in err.lower():
+                return "Instance already gone — COLD (full provisioning needed next time)."
             return f"Error destroying: {exc}"
 
     # ── Activity / countdown ─────────────────────────────────────────────────
@@ -287,19 +442,18 @@ class VastManager:
     # ── Background auto-shutdown monitor ─────────────────────────────────────
 
     def _monitor_loop(self) -> None:
-        """
-        Daemon thread: checks every 30 s.
-        When countdown reaches zero and the instance is READY, stops it.
-        """
+        """Daemon thread: auto-stops the instance after inactivity timeout."""
         while not self._stop_event.wait(30):
             if self.countdown_seconds() > 0:
                 continue
             try:
                 state, inst = self.get_state()
                 if state == "ready" and inst:
-                    logger.info("Auto-shutdown: stopping instance %s due to inactivity.", inst["id"])
+                    logger.info(
+                        "Auto-shutdown: stopping instance %s due to inactivity.",
+                        inst["id"],
+                    )
                     self._vast.stop_instance(id=inst["id"])
-                    # Back-date last_activity so the next check doesn't re-trigger immediately
                     with self._lock:
                         self._last_activity = time.time() - self.shutdown_seconds + 60
             except Exception as exc:

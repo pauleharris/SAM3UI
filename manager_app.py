@@ -104,10 +104,11 @@ def _cleanup():
 _STATE_STYLE = {
     "cold":     {"label": "COLD",        "color": "#6b7280", "desc": "No instance — GPU not running"},
     "standby":  {"label": "STANDBY",     "color": "#f59e0b", "desc": "Paused — disk preserved, fast restart available"},
-    "starting": {"label": "STARTING…",   "color": "#3b82f6", "desc": "Booting — SAM3 not ready yet"},
-    "ready":    {"label": "READY  ✓",    "color": "#10b981", "desc": "SAM3 is live — Gradio running"},
+    "starting": {"label": "STARTING…",   "color": "#3b82f6", "desc": "Booting — SAM not ready yet"},
+    "ready":    {"label": "READY  ✓",    "color": "#10b981", "desc": "SAM is live — Gradio running"},
     "stopping": {"label": "STOPPING…",   "color": "#f97316", "desc": "Instance stopping"},
-    "error":    {"label": "ERROR",        "color": "#ef4444", "desc": "Check logs"},
+    "unknown":  {"label": "UNKNOWN ⚠",   "color": "#8b5cf6", "desc": "Unrecognized VAST status — check Instance Log"},
+    "error":    {"label": "ERROR",        "color": "#ef4444", "desc": "VAST API error — check logs"},
 }
 
 
@@ -253,12 +254,12 @@ def _status_update(api_key: str):
         return (
             build_status_html("cold", None, 0, None),
             build_iframe_html(None, "cold"),
-            "(no instance)",
+            "(enter API key to connect)",
         )
     state, inst = mgr.get_state()
     url         = mgr.get_gradio_url(inst) if inst else None
     countdown   = mgr.countdown_seconds()
-    logs        = mgr.get_logs(inst) if inst else "(no instance running)"
+    logs        = mgr.get_diagnostics()
     return (
         build_status_html(state, inst, countdown, url),
         build_iframe_html(url, state),
@@ -420,6 +421,11 @@ def build_ui() -> gr.Blocks:
                 variant="secondary",
                 size="lg",
             )
+            refresh_btn = gr.Button(
+                "🔄  Refresh Now",
+                variant="secondary",
+                size="lg",
+            )
             destroy_btn = gr.Button(
                 "💥  Force Destroy",
                 variant="stop",
@@ -445,14 +451,14 @@ def build_ui() -> gr.Blocks:
             value=build_iframe_html(None, "cold"),
         )
 
-        # ── Live instance log ─────────────────────────────────────────────────
-        with gr.Accordion("📋 Instance Log (last 100 lines)", open=True):
+        # ── Instance log ─────────────────────────────────────────────────────
+        with gr.Accordion("📋 Instance Diagnostics (live)", open=True):
             instance_log = gr.Textbox(
                 label=None,
-                value="(no instance running)",
+                value="(enter API key to connect)",
                 interactive=False,
-                lines=18,
-                max_lines=18,
+                lines=20,
+                max_lines=20,
                 elem_id="instance-log",
             )
 
@@ -472,6 +478,13 @@ def build_ui() -> gr.Blocks:
         # Also refresh immediately when the API key is entered
         api_key.change(
             fn=on_api_key_change,
+            inputs=[api_key],
+            outputs=[status_html, iframe_html, instance_log],
+        )
+
+        # Refresh Now button — immediate manual poll
+        refresh_btn.click(
+            fn=_status_update,
             inputs=[api_key],
             outputs=[status_html, iframe_html, instance_log],
         )
