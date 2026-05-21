@@ -330,7 +330,8 @@ if [ ! -f /workspace/SAM3UI/.installed ]; then
     export HF_TOKEN="{hf_token}"
     export HUGGING_FACE_HUB_TOKEN="{hf_token}"
     mkdir -p checkpoints
-    huggingface-cli download facebook/sam3-large --local-dir checkpoints/ \
+    # Use 'hf' CLI (huggingface-cli is deprecated in newer hf_hub versions)
+    hf download facebook/sam3-large --local-dir checkpoints/ \
         || log "WARNING: HF download failed — check your token and model access"
 
     touch /workspace/SAM3UI/.installed
