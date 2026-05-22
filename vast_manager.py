@@ -38,7 +38,7 @@ DEFAULT_GPU_QUERY = (
     "inet_up>500 cuda_vers>=12.0 direct_port_count>2"
 )
 DEFAULT_DISK_GB   = 30
-SHUTDOWN_MINUTES  = 5
+SHUTDOWN_MINUTES  = 10
 
 # ── Comprehensive VAST status → logical state map ─────────────────────────────
 # Any status NOT in this dict returns "unknown" — never silently "starting".

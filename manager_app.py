@@ -249,6 +249,9 @@ def build_iframe_html(url: Optional[str], state: str) -> str:
 
 # ── Gradio event handlers ────────────────────────────────────────────────────
 
+_prev_state: dict = {}  # api_key -> last known state
+
+
 def _status_update(api_key: str):
     """Common refresh — returns (status_html, iframe_html, log_text)."""
     mgr = get_manager(api_key)
@@ -259,6 +262,12 @@ def _status_update(api_key: str):
             "(enter API key to connect)",
         )
     state, inst = mgr.get_state()
+    # Reset the inactivity timer the first time we see READY so the full
+    # 10-minute window starts from when the app is actually usable.
+    key = api_key.strip()
+    if _prev_state.get(key) != "ready" and state == "ready":
+        mgr.reset_activity()
+    _prev_state[key] = state
     url         = mgr.get_gradio_url(inst) if inst else None
     countdown   = mgr.countdown_seconds()
     logs        = mgr.get_diagnostics()
@@ -326,7 +335,7 @@ def on_destroy(api_key, *_):
 
 
 def on_reset_timer(api_key, *_):
-    """Reset the 5-minute inactivity countdown."""
+    """Reset the 10-minute inactivity countdown."""
     mgr = get_manager(api_key)
     if not mgr:
         return "⚠ Enter your VAST API key first."
